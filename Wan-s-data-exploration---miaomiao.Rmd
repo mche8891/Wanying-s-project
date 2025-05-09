@@ -1,0 +1,364 @@
+---
+title: "Wanying's data exploration - Miaomiao"
+author: "Andrius consultant group 1"
+date: "2025-05-02"
+output: html_document
+---
+
+
+
+```{r}
+library(simpleSeg)
+library(ggplot2)
+library(EBImage)
+library(cytomapper)
+library(reshape2)
+```
+
+```{r}
+# Create the marker metadata as a data frame
+marker_metadata <- data.frame(
+  Marker = c("CD45", "Ly6G", "CD115", "Siglec F", "CD3e", "B220", "NK1.1", "CD11b", "F4/80", "CD68",
+             "Ly6c", "CD16", "CX3CR1", "CCR2", "CD4", "CD8", "CD44", "CD62L", "MHCII", "CD11c",
+             "CD103", "CD317", "CD69", "CD31", "CD220", "Adipo-R-1", "CD38", "CD206", "CD163",
+             "CD80", "CD86", "TLR2", "TLR4", "Tim4", "CD172a", "VEGFR1", "alpha-SMA", "MMP9"),
+  Cell_Type = c("White blood cells", "Neutrophils", "Monocytes", "Eosinophils", "T cells", "B cells", "NK cells",
+                "Macrophages/DCs", "Murine Macrophages", "Macrophages/Monocytes/DCs",
+                "Monocytes", "Monocytes/NK cells", "Ly6Clo monocytes", "Ly6Chi monocytes",
+                "T cells", "T cells", "T cells", "T cells", "Dendritic cells/Macrophages", "Dendritic cells",
+                "Dendritic cells", "Dendritic cells", "Macrophages/NK/T cells", "Endothelial cells", "",
+                "", "Hepatic Stellate cells", "M2 Macrophage", "M2 Macrophage", "M1 Macrophage",
+                "M1 Macrophage", "M1 Macrophage", "M1 Macrophage", "Kupffer cells", "Myeloid cells", "",
+                "Hepatic Stellate cells", ""),
+  Phenotype_or_Function = c("", "", "", "", "", "", "",
+                            "Conventional DCs", "Kupffer cells", "Scavenger receptor for phago-lysosomal fusion",
+                            "Classical monocyte marker", "NK cells-ADCC Fc activity", "Migrate to M2 macrophage (liver, not Kupffer)",
+                            "Migrate to M1 macrophage (liver, not Kupffer)", "T helper or cytolytic", "T helper or cytolytic",
+                            "Naïve or memory phenotype", "Naïve or memory phenotype", "Antigen presenting mature DC", "Complement receptor on DCs",
+                            "Conventional DC", "Plasmacytoid DC", "Early activation marker", "PECAM-1 for leukocyte extravasation",
+                            "Insulin receptor", "Adiponectin receptor (liver fibrosis, HSC activity)", "",
+                            "M2a", "M2c", "CD80 NEGATIVE → M2b", "", "", "", "", "", "",
+                            "Myofibroblast", "Collagenase Type IV – ECM degradation"),
+  stringsAsFactors = FALSE
+)
+
+# Save as CSV
+write.csv(marker_metadata, file = "D:/Wanying project/marker_metadata.csv", row.names = FALSE)
+
+marker_metadata
+
+```
+
+
+
+
+```{r}
+library(EBImage)
+
+# Set path to your image folder
+image_dir <- "D:/Wanying project repository/Wanying-s-project/raw data/Mediem conc"
+
+# List all .tiff files
+tiff_files <- list.files(image_dir, pattern = "\\.tif{1,2}$", full.names = TRUE)
+
+# Read and store images in a named list
+marker_images <- lapply(tiff_files, readImage)
+names(marker_images) <- tools::file_path_sans_ext(basename(tiff_files))
+
+# Check image dimensions
+sapply(marker_images, dim)
+marker_images$`ADIPOR-1`
+```
+
+```{r}
+display(marker_images[["CD8"]])
+```
+
+## EBImage
+
+```{r}
+
+# 1. Extract DNA channel from a marker image (e.g., CD68)
+img <- marker_images[["CD68"]]
+dna <- img[,,2]
+
+# 2. Normalize and clean
+dna <- Image(dna, colormode = "Grayscale")
+dna <- normalize(dna)
+dna[is.na(dna)] <- 0
+dna[is.infinite(dna)] <- 0
+
+# 3. Blur and threshold
+blurred <- gblur(dna, sigma = 2)
+thresholded <- thresh(blurred, w = 15, h = 15, offset = 0.05)
+
+# 4. Remove small noise and fill
+cleaned <- opening(thresholded, makeBrush(5, shape = "disc"))
+filled <- fillHull(bwlabel(cleaned))
+
+# 5. Label the final mask
+cell_mask <- bwlabel(filled)
+cell_mask <- Image(cell_mask)
+
+# 6. Visualize just the mask (no color overlay)
+# Brighter = higher label, black = background
+display(normalize(cell_mask), method = "raster")
+
+img <- marker_images[["CD68"]]  # should return a 693x398x2 array
+dim(img)
+cat("Number of segmented cells:", max(cell_mask), "\n")
+```
+
+
+
+```{r}
+# Step 1: Normalize DNA again
+dna <- Image(img[,,2], colormode = "Grayscale")
+dna <- normalize(dna)
+dna[is.na(dna)] <- 0
+dna[is.infinite(dna)] <- 0
+
+# Step 2: Softer blur (lower sigma)
+blurred <- gblur(dna, sigma = 1.5)  # smaller than before
+
+# Step 3: Threshold with more aggressive settings
+thresholded <- thresh(blurred, w = 15, h = 15, offset = 0.01)  # smaller offset
+
+# Step 4: Clean small objects
+cleaned <- opening(thresholded, makeBrush(3, shape = "disc"))
+filled <- fillHull(bwlabel(cleaned))
+
+# Step 5: Label the regions again
+cell_mask <- bwlabel(filled)
+cell_mask <- Image(cell_mask, colormode = "Grayscale")
+
+# Step 6: Check the summary
+summary(as.numeric(cell_mask))
+
+```
+
+
+```{r}
+# === Step 0: Load and preprocess DNA channel (Ir191, channel 2) ===
+img <- marker_images[["CD8"]] 
+dna <- Image(img[,,2], colormode = "Grayscale")
+
+dna <- normalize(dna)
+dna[is.na(dna)] <- 0
+dna[is.infinite(dna)] <- 0
+dna[dna < 0] <- 0
+dna[dna > 1] <- 1
+
+# === Step 1: Detect all cell-like regions (binary mask) ===
+blurred <- gblur(dna, sigma = 1)  # Tune sigma if needed
+binary_mask <- thresh(blurred, w = 15, h = 15, offset = 0.04)
+binary_mask <- opening(binary_mask, makeBrush(5, shape = "disc"))
+binary_mask <- fillHull(bwlabel(binary_mask))
+
+# Optional: Visualize Step 1 result
+display(binary_mask, method = "raster")  # White = potential cells
+
+# === Step 2: Split into individual cells using distance + propagate ===
+distance_map <- distmap(binary_mask)
+seeds <- bwlabel(binary_mask)
+segmented_cells <- propagate(dna, seeds = seeds, mask = binary_mask)
+
+# === Step 3: Clean final mask for display ===
+segmented_cells[is.na(segmented_cells)] <- 0
+segmented_cells[is.infinite(segmented_cells)] <- 0
+segmented_cells <- Image(segmented_cells, colormode = "Grayscale")
+
+# === Step 4: Display Results ===
+# Grayscale = label number (0 = background, 1+ = cells)
+display(normalize(segmented_cells), method = "raster")
+display(colorLabels(segmented_cells), method = "raster")
+
+# Color version = each cell is a different color
+#display(colorLabels(segmented_cells), method = "raster")
+
+# count how many cells were segmented
+cat("Number of segmented cells:", max(segmented_cells), "\n")
+
+```
+
+
+
+
+
+
+## Summary intensity
+
+
+
+
+
+```{r}
+# Ensure the segmentation is integer-labeled
+segmented_cells <- round(segmented_cells)
+segmented_cells <- as.integer(segmented_cells)
+
+# Step 1: Get real cell IDs
+cell_ids <- sort(unique(segmented_cells))
+cell_ids <- cell_ids[cell_ids != 0]  # remove background (0)
+
+# Step 2: Initialize result matrix
+marker_names <- names(marker_images)
+intensity_matrix <- matrix(NA, nrow = length(cell_ids), ncol = length(marker_names))
+rownames(intensity_matrix) <- paste0("Cell_", cell_ids)
+colnames(intensity_matrix) <- marker_names
+
+# Step 3: Extract mean marker intensity per cell
+for (m in seq_along(marker_names)) {
+  marker <- marker_names[m]
+  img_stack <- marker_images[[marker]]
+  
+  # Use marker channel (assumed to be channel 1)
+  marker_img <- normalize(Image(img_stack[,,1], colormode = "Grayscale"))
+
+  # Compute mean per cell using integer segmentation mask
+  mean_vals <- tapply(marker_img, segmented_cells, mean)
+
+  # Assign values based on true cell ID
+  intensity_matrix[, m] <- mean_vals[as.character(cell_ids)]
+}
+
+# Step 4: Final data frame
+intensity_df <- as.data.frame(intensity_matrix)
+
+# Check structure
+intensity_df
+```
+
+
+Here each value represent the average marker intensity (expression level) inside a single segmented cell.
+
+This df aligns with our previews segmentation that now we have 599 cells (same as above) with 34 columns each represents the individual markers in the red channel.
+
+Next we could do some visualisation as to see the patterns or visualisations
+
+```{r}
+
+# Step 1: Ensure all columns are numeric
+plot_data <- as.data.frame(lapply(plot_data, as.numeric))
+
+# Step 2: Melt into long format
+plot_data_long <- melt(plot_data, variable.name = "Marker", value.name = "Intensity")
+
+# Step 3: Plot
+ggplot(plot_data_long, aes(x = Marker, y = Intensity)) +
+  geom_boxplot(outlier.size = 0.5, fill = "skyblue") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  ggtitle("Marker Expression Across All Cells")
+```
+
+
+
+
+### Extra methods try
+```{r}
+# 1. Extract and normalize the DNA (Ir191) channel from a marker image
+dna <- normalize(Image(marker_images[["CD68"]][,,2], colormode = "Grayscale"))
+
+# 2. Threshold to identify cell-like regions
+binary_mask <- thresh(dna, w = 15, h = 15, offset = 0.03)
+
+# 3. Create a distance map and initial seeds
+distance_map <- distmap(binary_mask)
+seeds <- bwlabel(binary_mask)  # centers of blobs
+
+# 4. Use propagate to segment individual cells based on seeds + image gradient
+prop_mask <- propagate(dna, seeds = seeds, mask = binary_mask)
+
+# 5. Fill internal holes in the segmentation
+prop_filled <- fillHull(prop_mask)
+
+# 6. Create grayscale RGB background for visualization
+background <- rgbImage(red = dna, green = dna, blue = dna)
+
+# 7. Paint the segmented cells on the background
+overlay_outlines <- paintObjects(prop_mask, background, col = "#ff00ff")   # outlines
+overlay_filled   <- paintObjects(prop_filled, background, col = "#00ff00") # solid fill
+
+# 8. Display both
+display(overlay_outlines, method = "raster")
+display(overlay_filled, method = "raster")
+
+
+```
+
+
+```{r}
+
+# Load CD68 and extract DNA channel
+img <- marker_images[["CD68"]]
+dna <- Image(img[,,2], colormode = "Grayscale")
+dna <- normalize(dna)
+dna[is.na(dna)] <- 0
+dna[is.infinite(dna)] <- 0
+dna[dna < 0] <- 0
+dna[dna > 1] <- 1
+
+# Segmentation
+blurred <- gblur(dna, sigma = 2)
+thresh_img <- thresh(blurred, w = 15, h = 15, offset = 0.05)
+cleaned <- opening(thresh_img, makeBrush(5, shape = "disc"))
+filled <- fillHull(bwlabel(cleaned))
+cell_mask <- bwlabel(filled)
+cell_mask <- Image(cell_mask, colormode = "Grayscale")
+cell_mask[is.na(cell_mask)] <- 0
+cell_mask[is.infinite(cell_mask)] <- 0
+
+# Create an RGB image where each cell gets its own random color
+dims <- dim(cell_mask)
+rgb_array <- array(0, dim = c(dims[1], dims[2], 3))
+num_cells <- max(cell_mask)
+colors <- col2rgb(rainbow(num_cells))
+
+for (i in 1:num_cells) {
+  mask_i <- cell_mask == i
+  for (channel in 1:3) {
+    rgb_array[,,channel] <- rgb_array[,,channel] + mask_i * (colors[channel, i] / 255)
+  }
+}
+
+# Blend colored mask with normalized DNA as background (grayscale to RGB)
+dna_rgb <- toRGB(dna)
+alpha <- 0.6  # cell color opacity
+blended_rgb <- (1 - alpha) * dna_rgb + alpha * rgb_array
+blended_rgb <- Image(blended_rgb, colormode = "Color")
+blended_rgb[blended_rgb < 0] <- 0
+blended_rgb[blended_rgb > 1] <- 1
+
+# Show result
+display(blended_rgb, method = "raster")
+
+
+```
+
+
+## Simple seg
+
+
+```{r}
+# Normalized DNA channel
+dna <- normalize(Image(marker_images[["CD68"]][,,2], colormode = "Grayscale"))
+
+# Optional transform (simpleSeg uses sqrt)
+dna_sqrt <- sqrt(dna)
+
+# Threshold
+binary_mask <- thresh(dna_sqrt, w = 25, h = 25, offset = 0.03)
+
+# Distance map and propagate
+distance_map <- distmap(binary_mask)
+seeds <- bwlabel(binary_mask)
+segmented_cells <- propagate(dna_sqrt, seeds = seeds, mask = binary_mask)
+
+# Display
+display(colorLabels(segmented_cells), method = "raster")
+
+```
+
+## Reference
+
+https://bioconductor.statistik.tu-dortmund.de/packages/2.12/bioc/vignettes/EBImage/inst/doc/EBImage-introduction.pdf
