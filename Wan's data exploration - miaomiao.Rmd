@@ -12,6 +12,7 @@ library(simpleSeg)
 library(ggplot2)
 library(EBImage)
 library(cytomapper)
+library(reshape2)
 ```
 
 ```{r}
@@ -185,7 +186,7 @@ cat("Number of segmented cells:", max(segmented_cells), "\n")
 
 
 
-
+## Summary intensity
 
 
 
@@ -223,22 +224,32 @@ for (m in seq_along(marker_names)) {
 
 # Step 4: Final data frame
 intensity_df <- as.data.frame(intensity_matrix)
-intensity_df$CellID <- rownames(intensity_df)
 
 # Check structure
 intensity_df
 ```
 
 
+Here each value represent the average marker intensity (expression level) inside a single segmented cell.
 
+This df aligns with our previews segmentation that now we have 599 cells (same as above) with 34 columns each represents the individual markers in the red channel.
 
+Next we could do some visualisation as to see the patterns or visualisations
 
+```{r}
 
+# Step 1: Ensure all columns are numeric
+plot_data <- as.data.frame(lapply(plot_data, as.numeric))
 
+# Step 2: Melt into long format
+plot_data_long <- melt(plot_data, variable.name = "Marker", value.name = "Intensity")
 
-
-
-
+# Step 3: Plot
+ggplot(plot_data_long, aes(x = Marker, y = Intensity)) +
+  geom_boxplot(outlier.size = 0.5, fill = "skyblue") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  ggtitle("Marker Expression Across All Cells")
+```
 
 
 
