@@ -9,6 +9,8 @@ output: html_document
 library(reshape2)
 library(dplyr)
 library(EBImage)
+library(reshape2)
+library(umap)
 ```
 
 # Data loading
@@ -29,7 +31,7 @@ sapply(marker_images, dim)
 marker_images$`ADIPOR-1`
 ```
 
-
+As looking at the image we have, I noticed in some images—that the red channel appears completely saturated. This might suggest overexpression of that marker or an issue with image scaling. It would be helpful to revisit the normalization and contrast settings to ensure we’re not losing useful biological information.
 
 # Preprocessing
 
@@ -110,6 +112,28 @@ cat("Number of segmented cells:", max(segmented), "\n")
 ```
 
 
+
+```{r}
+# Extract red channel (e.g., CD8)
+red_marker <- normalize(Image(img[,,1], colormode = "Grayscale"))
+
+# Convert segmentation labels to a normalized grayscale mask
+seg_mask <- normalize(segmented > 0)  # binary mask
+
+# Create RGB overlay: red = CD8, green = segmentation mask
+overlay_rgb <- rgbImage(
+  red = red_marker,
+  green = seg_mask,
+  blue = red_marker * 0
+)
+
+display(overlay_rgb, method = "raster", title = "Segmentation Overlay on CD8 Marker")
+
+```
+
+
+
+
 # Intensity analysis
 
 ```{r}
@@ -149,11 +173,34 @@ for (m in seq_along(marker_names)) {
 # === Step 4: Convert to data frame for analysis ===
 intensity_df <- as.data.frame(intensity_matrix)
 
-# Preview result
-head(intensity_df)
+intensity_df
 
 ```
+```{r}
+# Convert to long format
+intensity_df$CellID <- rownames(intensity_df)
+long_df <- reshape2::melt(intensity_df, id.vars = "CellID", variable.name = "ImageID", value.name = "Intensity")
 
+# Clean image names (e.g., remove ".tiff.1")
+long_df$ImageID <- sub("\\.tiff\\..*", "", long_df$ImageID)
+
+# Summary stats per image/marker
+image_marker_stats <- long_df %>%
+  group_by(ImageID) %>%
+  summarise(
+    b.mean = mean(Intensity, na.rm = TRUE),
+    b.sd   = sd(Intensity, na.rm = TRUE),
+    b.mad  = mad(Intensity, na.rm = TRUE),
+    b.q001 = quantile(Intensity, 0.001, na.rm = TRUE),
+    b.q005 = quantile(Intensity, 0.005, na.rm = TRUE),
+    b.q05  = quantile(Intensity, 0.05, na.rm = TRUE),
+    b.q095 = quantile(Intensity, 0.95, na.rm = TRUE),
+    b.q099 = quantile(Intensity, 0.99, na.rm = TRUE)
+  )
+
+image_marker_stats
+```
+This table summarizes the **distribution of marker expression across all cells within each image**. For every marker (represented by the `ImageID`, which corresponds to a specific marker image), it calculates key statistics: the mean intensity (`b.mean`), standard deviation (`b.sd`), and median absolute deviation (`b.mad`), as well as several quantiles (`b.q001`, `b.q005`, `b.q05`, `b.q095`, `b.q099`). These values help capture both the **central tendency and variability** of marker expression across cells. Such summary statistics are useful for identifying **differences in staining intensity**, **signal consistency**, or **outlier markers**, and can aid in **quality control** or **comparing overall marker abundance** between tissue samples.
 
 
 ```{r}
@@ -212,6 +259,78 @@ ggplot(long_df, aes(x = Marker, y = Intensity)) +
 
 
 
+
+
+
+# Clustering
+
+
+
+## normalisation
+
+```{r}
+# Drop CellID column for clustering input
+intensity_mat <- intensity_df[, setdiff(names(intensity_df), "CellID")]
+
+# Optional: log-transform if you have skewed intensities
+intensity_log <- log1p(intensity_mat)
+
+# Standardize
+scaled_data <- scale(intensity_log)
+
+```
+
+
+## PCA 
+```{r}
+pca_res <- prcomp(scaled_data, center = TRUE, scale. = FALSE)
+summary(pca_res)  # Check how many PCs explain 80–95% variance
+
+# Extract scores
+pc_scores <- as.data.frame(pca_res$x[, 1:5])  
+pc_scores$CellID <- intensity_df$CellID
+
+```
+
+## clustering
+```{r}
+set.seed(1)
+kmeans_res <- kmeans(pc_scores[, 1:5], centers = 5)  
+pc_scores$Cluster <- factor(kmeans_res$cluster)
+umap_res <- umap(pc_scores[, 1:5])
+plot(umap_res$layout, col = pc_scores$Cluster, pch = 16,
+     main = "UMAP: Cell Clusters by Marker Expression")
+
+```
+Here, cells in the same cluster express similar combinations of markers, and are likely to be the same cell type or functional state.
+
+The UMAP projection reveals clear separation between clusters of cells based on their marker expression profiles. This indicates distinct phenotypic subpopulations within the tissue. 
+
+
+```{r}
+# Choose marker to plot
+marker_to_plot <- "CD44"
+
+# Extract UMAP layout and matching marker intensity
+plot_df <- data.frame(
+  UMAP1 = umap_res$layout[, 1],
+  UMAP2 = umap_res$layout[, 2],
+  Intensity = intensity_df[[marker_to_plot]]
+)
+
+# Plot using ggplot2
+library(ggplot2)
+
+ggplot(plot_df, aes(x = UMAP1, y = UMAP2, color = Intensity)) +
+  geom_point(size = 1.5) +
+  scale_color_gradient(low = "gray90", high = "red") +
+  labs(
+    title = paste("UMAP: Cells Colored by", marker_to_plot, "Expression"),
+    color = "Intensity"
+  ) +
+  theme_minimal()
+
+```
 
 
 
