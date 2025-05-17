@@ -1,0 +1,530 @@
+---
+title: "Wanying consultation report draft"
+author: "Wanying consultant group 2"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    theme: journal
+    code_folding: hide
+    toc: true
+    toc_depth: 3
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+number-sections: true
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r library_load,warning = FALSE, message=FALSE}
+library(reshape2)
+library(dplyr)
+library(EBImage)
+library(ggrepel)
+library(reshape2)
+library(umap)
+library(e1071)
+```
+# Executive summary
+
+# Introduction & Objextives
+
+The client provided us with imaging mass cytometry (IMC) data from tissue samples and requested assistance with image quantification and cell density analysis. However, recognizing that IMC data offers far more analytical possibilities than basic cell counting, we expanded our analysis to address several key questions that would provide comprehensive insights into the client's samples:
+
+1. Which markers in the panel are performing effectively? Some markers in multiplex imaging panels may not produce reliable signal due to antibody issues, low target expression, or technical limitations. We implemented a systematic marker effectiveness analysis to identify which markers provide meaningful biological information.
+
+2. What are the expression patterns of different markers at the single-cell level? Beyond simple presence/absence, understanding the distribution and heterogeneity of marker expression across cells provides deeper biological insights and helps identify cell subpopulations.
+
+3. How do different markers correlate at the cellular level? Patterns of co-expression can reveal functional relationships between markers and help identify specific cell types or states within the tissue microenvironment.
+
+4. What is the spatial organization of different markers within the tissue? The spatial context of marker expression provides important information about tissue architecture and cellular interactions that is lost in dissociated cell analyses.
+
+By addressing these questions through our analytical pipeline, we aim to provide the client with a comprehensive characterization of their tissue samples that extends well beyond basic cell density measurements, enabling richer biological interpretation and more informed decision-making for their research.
+
+
+
+
+# Data overview & Exploration
+
+
+We first load in the dataset been provuded:
+```{r data_load}
+# Here we load in the dataset(images) provided
+image_dir <- "raw data/Mediem conc"
+tiff_files <- list.files(image_dir, pattern = "\\.tif{1,2}$", full.names = TRUE)
+marker_images <- lapply(tiff_files, readImage)
+names(marker_images) <- tools::file_path_sans_ext(basename(tiff_files))
+
+```
+
+
+
+```{r display, warning=FALSE}
+first_marker_name <- names(marker_images)[1]  # Get name of first marker
+first_image <- marker_images[[1]]             # Get first image
+
+# Print information about the image
+cat("First marker name:", first_marker_name, "\n")
+cat("Image class:", class(first_image), "\n")
+cat("Image dimensions:", paste(dim(first_image), collapse=" x "), "\n")
+
+# Create colored versions of the channels
+# Extract channels
+channel1 <- normalize(first_image[,,1])  # Red channel (marker)
+channel2 <- normalize(first_image[,,2])  # Cyan channel (DNA/cells)
+
+# Create RGB images with proper coloring
+# For red channel (channel 1)
+red_colored <- Image(array(0, dim=c(dim(channel1), 3)), colormode="Color")
+red_colored[,,1] <- channel1  # R channel
+red_colored[,,2] <- 0         # G channel
+red_colored[,,3] <- 0         # B channel
+
+# For cyan channel (channel 2)
+cyan_colored <- Image(array(0, dim=c(dim(channel2), 3)), colormode="Color")
+cyan_colored[,,1] <- 0         # R channel
+cyan_colored[,,2] <- channel2  # G channel
+cyan_colored[,,3] <- channel2  # B channel
+
+# Display both channels with proper coloring
+par(mfrow=c(1,2))
+display(red_colored, method="raster", main="Channel 1 - Marker (Red)")
+display(cyan_colored, method="raster", main="Channel 2 - Cell/DNA (Cyan)")
+par(mfrow=c(1,1))
+```
+
+
+The figure above displays the two channels of our imaging mass cytometry data for the marker ADIPOR-1 (the first marker in our dataset). The left panel shows Channel 1 (red), which contains the specific marker signal that indicates protein expression. The right panel shows Channel 2 (cyan), which represents the DNA/nuclear signal that delineates individual cells. These two channels provide complementary information: Channel 1 allows us to assess the distribution and intensity of specific protein markers across the tissue sample, while Channel 2 enables identification of cellular structures and can be used for cell segmentation. In a typical analysis workflow, we evaluate marker effectiveness using Channel 1, then perform cell segmentation using Channel 2, and finally integrate both channels to quantify marker expression at the single-cell level. The proper visualization of these channels in their correct colors (red for marker, cyan for DNA) helps in understanding the spatial distribution of both signals across the tissue.
+
+
+
+
+
+# Analysis
+
+## 1. Marker Effectiveness Analysis
+
+**Mean Intensity**
+- Formula: $\mu = \frac{1}{n}\sum_{i=1}^{n}x_i$
+- Represents the average signal intensity across all pixels in the marker channel
+- Higher values generally indicate stronger marker expression
+
+**Median Intensity**
+- Formula: Middle value of all pixel intensities when sorted
+- Represents the typical intensity value, less affected by outliers than mean
+- Zero median suggests most pixels have no signal
+
+**Standard Deviation (SD)**
+- Formula: $\sigma = \sqrt{\frac{1}{n}\sum_{i=1}^{n}(x_i-\mu)^2}$
+- Measures the spread of intensity values around the mean
+
+**Coefficient of Variation (CV)**
+- Formula: $CV = \frac{\sigma}{\mu}$
+- Normalizes standard deviation by the mean
+- Indicates signal variability relative to signal strength
+- High values suggest noisy signal or high heterogeneity
+
+**Skewness**
+- Formula: $\text{Skewness} = \frac{1}{n}\sum_{i=1}^{n}(\frac{x_i-\mu}{\sigma})^3$
+- Measures asymmetry of the intensity distribution
+- Positive values indicate longer tail toward higher intensities
+- Higher values typically suggest clearer positive cell populations
+
+**Entropy**
+- Formula: $\text{Entropy} = -\sum_{i} p_i \log_2(p_i)$
+- Where $p_i$ is the probability of pixel intensity falling in bin $i$
+- Quantifies randomness or organization of marker distribution
+- Lower values indicate more structured, non-random distribution (typically better)
+
+**Quality Score**
+- Formula: $\text{Quality Score} = Z(\text{Mean}) + Z(\text{Skewness}) - Z(\text{Entropy})$
+- Where $Z()$ indicates standardization: $Z(x) = \frac{x - \mu_x}{\sigma_x}$
+- Combined score that rewards high mean intensity, high skewness, and low entropy
+- Used for ranking markers from most to least informative
+
+
+```{r}
+#############################################################
+## Marker Effectiveness Analysis
+#############################################################
+
+# Calculate statistics for all markers
+marker_stats <- data.frame()
+
+for (marker_name in names(marker_images)) {
+  # Extract marker channel from image
+  img <- marker_images[[marker_name]]
+  marker_channel <- img[,,1]  # Channel 1 (marker)
+  
+  # Get values and calculate statistics
+  marker_values <- as.vector(marker_channel)
+  
+  # Basic statistics
+  mean_val <- mean(marker_values, na.rm = TRUE)
+  median_val <- median(marker_values, na.rm = TRUE)
+  sd_val <- sd(marker_values, na.rm = TRUE)
+  cv <- sd_val / mean_val
+  
+  # SNR calculation
+  top_10 <- quantile(marker_values, 0.9, na.rm = TRUE)
+  bottom_10 <- quantile(marker_values, 0.1, na.rm = TRUE)
+  signal <- mean(marker_values[marker_values >= top_10], na.rm = TRUE)
+  noise <- mean(marker_values[marker_values <= bottom_10], na.rm = TRUE)
+  
+  # Skewness and entropy
+  skew <- skewness(marker_values, na.rm = TRUE)
+  
+  # Calculate entropy
+  breaks <- seq(min(marker_values, na.rm = TRUE), max(marker_values, na.rm = TRUE), length.out = 20)
+  bins <- cut(marker_values, breaks = breaks)
+  bin_counts <- table(bins)
+  bin_probs <- bin_counts / sum(bin_counts)
+  entropy <- -sum(bin_probs * log2(bin_probs + 1e-10))
+  
+  # Add to results
+  marker_stats <- rbind(marker_stats, data.frame(
+    Marker = marker_name,
+    Mean = mean_val,
+    Median = median_val,
+    SD = sd_val,
+    CV = cv,
+    Skewness = skew,
+    Entropy = entropy
+  ))
+}
+
+# Create quality score and rank markers
+marker_stats$QualityScore <- scale(marker_stats$Mean) + 
+                            scale(marker_stats$Skewness) - 
+                            scale(marker_stats$Entropy)
+
+# Sort by quality score
+marker_stats <- marker_stats[order(marker_stats$QualityScore, decreasing = TRUE), ]
+
+# Identify non-informative markers
+threshold <- quantile(marker_stats$QualityScore, 0.25, na.rm = TRUE)
+non_informative <- marker_stats$Marker[marker_stats$QualityScore <= threshold]
+
+# Display results
+print(marker_stats[, c("Marker", "Mean", "Median", "CV", "Skewness", "Entropy", "QualityScore")])
+cat("Non-informative markers:", paste(non_informative, collapse = ", "), "\n")
+
+
+```
+
+```{r histogram}
+# Create visualization with smaller y-axis text
+quality_plot <- ggplot(marker_stats, aes(x = reorder(Marker, QualityScore), y = QualityScore)) +
+  geom_bar(stat = "identity", aes(fill = QualityScore)) +
+  scale_fill_gradient(low = "red", high = "green") +
+  coord_flip() +
+  labs(title = "Marker Quality Assessment", x = "Marker", y = "Quality Score") +
+  theme_minimal() +
+  # Add these lines to reduce y-axis text size
+  theme(
+    axis.text.y = element_text(size = 7),    # Smaller text for marker names
+    axis.title = element_text(size = 9)     # Slightly smaller axis titles
+  )
+
+print(quality_plot)
+```
+
+```{r buble_plot,fig.width=6, fig.height=5}
+bubble_plot <- ggplot(marker_stats, aes(x = Skewness, y = CV)) +
+  geom_point(aes(size = Mean, color = Entropy), alpha = 0.7) +
+  scale_color_gradient(low = "green", high = "red") +
+  # Replace geom_text with geom_text_repel
+  geom_text_repel(aes(label = Marker), size = 2, 
+                 box.padding = 0.5,
+                 point.padding = 0.2,
+                 force = 5,
+                 segment.size = 0.2,
+                 max.overlaps = 30) +
+  labs(title = "Marker Quality Bubble Plot",
+       x = "Skewness (higher is better)",
+       y = "Coefficient of Variation",
+       size = "Mean Intensity",
+       color = "Entropy (lower is better)") +
+  theme_minimal() +
+  theme(legend.position = "right")
+
+print(bubble_plot)
+```
+
+
+```{r}
+# Display best and worst markers
+best_marker <- marker_stats$Marker[1]
+worst_marker <- marker_stats$Marker[nrow(marker_stats)]
+
+par(mfrow = c(1, 2))
+display(normalize(marker_images[[best_marker]][,,1]), 
+        method = "raster", title = paste("Best:", best_marker))
+display(normalize(marker_images[[worst_marker]][,,1]), 
+        method = "raster", title = paste("Worst:", worst_marker))
+par(mfrow = c(1, 1))
+```
+Here is the comparison of the good marker and a useless marker, ss looking at the image we have in the right hand side, we noticed in some images—that the red channel appears completely saturated. This might suggest overexpression of that marker or an issue with image scaling. It would be helpful to revisit the normalization and contrast settings to ensure we’re not losing useful biological information.Thus we decided to remove those images(markers) in our further analysis.
+
+We identified and removed the least informative markers (those in the bottom 25% of quality scores). These markers showed characteristics of poor signal quality, including low mean intensity, low skewness, and/or high entropy, suggesting they may not reliably distinguish positive from negative cells. By filtering out these non-informative markers, we can focus our subsequent analyses on the most reliable markers, improving the robustness of our cell segmentation and clustering results. The next step in our analysis pipeline is cell segmentation using the DNA channel (Channel 2), followed by quantification of marker expression at the single-cell level using only the informative markers we've identified.
+
+
+```{r}
+# Create filtered marker list
+informative_markers <- setdiff(names(marker_images), non_informative)
+marker_images_filtered <- marker_images[informative_markers]
+
+# Check how many markers we retained
+cat("Retained", length(marker_images_filtered), "informative markers out of", 
+    length(marker_images), "total markers\n")
+
+```
+
+## 2. Cell Segmentation
+
+
+### 2.1 Segmentation
+
+```{r}
+#############################################################
+## Cell Segmentation Using Reference DNA Channel
+#############################################################
+
+# Use the first filtered marker as reference for DNA channel
+reference_marker <- names(marker_images_filtered)[1]
+cat("Using", reference_marker, "as reference for DNA channel\n")
+
+# === Step 0: Load and preprocess DNA channel (Ir191, channel 2) with intensity squaring ===
+img <- marker_images_filtered[[reference_marker]] 
+dna <- Image(img[,,2], colormode = "Grayscale")
+
+# Handle NA/NaN/Inf values
+dna[is.na(dna)] <- 0
+dna[is.infinite(dna)] <- 0
+
+# Square the intensity values to emphasize cells as suggested
+# First normalize to 0-1 range
+if(max(dna) > min(dna)) {
+  dna_norm <- (dna - min(dna)) / (max(dna) - min(dna))
+} else {
+  dna_norm <- dna * 0
+}
+
+# Square the intensity values
+dna_squared <- dna_norm^2
+
+# Re-normalize after squaring
+dna_squared <- normalize(dna_squared)
+dna_squared[is.na(dna_squared)] <- 0
+dna_squared[is.infinite(dna_squared)] <- 0
+
+display(dna, method = "raster", title = "Original Intensity")
+display(dna_squared, method = "raster", title = "Squared Intensity")
+
+# === Step 1: Apply thresholding on squared intensity image ===
+# First blur to reduce noise
+blurred <- gblur(dna_squared, sigma = 1)
+blurred[is.na(blurred)] <- 0
+
+# Thresholding - might need a different offset due to squaring
+binary_mask <- thresh(blurred, w = 15, h = 15, offset = 0.15)  # Adjust offset as needed
+display(binary_mask, method = "raster", title = "Binary Mask")
+
+# === Step 2: Detect bright regions to use as seeds ===
+high_intensity <- dna_squared > 0.2  # Tune this threshold if needed
+high_intensity <- opening(high_intensity, makeBrush(3, shape = "disc"))  # Remove noise
+center_seeds <- bwlabel(high_intensity)
+
+# === Step 3: Segment using propagate ===
+segmented <- propagate(x = dna_squared, seeds = center_seeds, mask = binary_mask)
+
+# Clean up
+segmented[is.na(segmented)] <- 0
+segmented[is.infinite(segmented)] <- 0
+segmented <- Image(segmented, colormode = "Grayscale")
+
+# Display segmented result
+display(colorLabels(segmented), method = "raster", title = "Segmented Cells")
+cat("Number of segmented cells:", max(segmented), "\n")
+
+# Create overlay visualizations for filtered markers
+marker_overlays <- list()
+
+for (marker_name in names(marker_images_filtered)) {
+  # Extract red channel (marker channel)
+  marker_img <- marker_images_filtered[[marker_name]]
+  red_marker <- normalize(Image(marker_img[,,1], colormode = "Grayscale"))
+  
+  # Convert segmentation labels to a normalized grayscale mask
+  seg_mask <- normalize(segmented > 0)  # binary mask
+  
+  # Create RGB overlay: red = marker, green = segmentation mask
+  overlay_rgb <- rgbImage(
+    red = red_marker,
+    green = seg_mask,
+    blue = red_marker * 0
+  )
+  
+  marker_overlays[[marker_name]] <- overlay_rgb
+}
+
+# Display overlay for a few filtered markers (first 3 if available)
+display_count <- min(2, length(marker_images_filtered))
+par(mfrow = c(1, display_count))
+
+for (i in 1:display_count) {
+  marker <- names(marker_images_filtered)[i]
+  display(marker_overlays[[marker]], method = "raster", 
+          title = paste("Overlay -", marker))
+}
+
+par(mfrow = c(1, 1))
+
+
+```
+
+
+### 2.2 Intensity analsyis
+
+```{r}
+#############################################################
+## Per-Cell Marker Intensity Analysis
+#############################################################
+
+# === Step 0: Clean up and ensure integer-labeled segmentation mask ===
+segmented_cells <- round(segmented)
+segmented_cells <- as.integer(segmented_cells)
+
+# === Step 1: Get valid cell IDs (exclude background) ===
+cell_ids <- sort(unique(segmented_cells))
+cell_ids <- cell_ids[cell_ids != 0]  # remove background label 0
+
+# === Step 2: Prepare results matrix ===
+marker_names <- names(marker_images_filtered)
+intensity_matrix <- matrix(NA, nrow = length(cell_ids), ncol = length(marker_names))
+rownames(intensity_matrix) <- paste0("Cell_", cell_ids)
+colnames(intensity_matrix) <- marker_names
+
+# === Step 3: Loop through each marker image and compute mean intensity per cell ===
+for (m in seq_along(marker_names)) {
+  marker <- marker_names[m]
+  img_stack <- marker_images_filtered[[marker]]
+  
+  # Use channel 1 by default (adjust if needed)
+  marker_img <- normalize(Image(img_stack[,,1], colormode = "Grayscale"))
+  
+  # Handle NA/Inf
+  marker_img[is.na(marker_img)] <- 0
+  marker_img[is.infinite(marker_img)] <- 0
+
+  # Compute mean intensity per labeled cell
+  mean_vals <- tapply(marker_img, segmented_cells, mean)
+
+  # Map results back to the matrix in correct order
+  intensity_matrix[, m] <- mean_vals[as.character(cell_ids)]
+}
+
+# === Step 4: Convert to data frame for analysis ===
+intensity_df <- as.data.frame(intensity_matrix)
+
+# Display first few rows
+head(intensity_df)
+```
+
+
+```{r}
+# Convert to long format
+intensity_df$CellID <- rownames(intensity_df)
+long_df <- reshape2::melt(intensity_df, id.vars = "CellID", variable.name = "ImageID", value.name = "Intensity")
+
+# Clean image names (e.g., remove ".tiff.1")
+long_df$ImageID <- sub("\\.tiff\\..*", "", long_df$ImageID)
+
+# Summary stats per image/marker
+image_marker_stats <- long_df %>%
+  group_by(ImageID) %>%
+  summarise(
+    b.mean = mean(Intensity, na.rm = TRUE),
+    b.sd   = sd(Intensity, na.rm = TRUE),
+    b.mad  = mad(Intensity, na.rm = TRUE),
+    b.q001 = quantile(Intensity, 0.001, na.rm = TRUE),
+    b.q005 = quantile(Intensity, 0.005, na.rm = TRUE),
+    b.q05  = quantile(Intensity, 0.05, na.rm = TRUE),
+    b.q095 = quantile(Intensity, 0.95, na.rm = TRUE),
+    b.q099 = quantile(Intensity, 0.99, na.rm = TRUE)
+  )
+
+# Display stats
+image_marker_stats
+```
+This table summarizes the distribution of marker expression across all cells within each image. For every marker (represented by the ImageID, which corresponds to a specific marker image), it calculates key statistics: the mean intensity (b.mean), standard deviation (b.sd), and median absolute deviation (b.mad), as well as several quantiles (b.q001, b.q005, b.q05, b.q095, b.q099). These values help capture both the central tendency and variability of marker expression across cells. Such summary statistics are useful for identifying differences in staining intensity, signal consistency, or outlier markers, and can aid in quality control or comparing overall marker abundance between tissue samples.
+
+
+```{r}
+# Step 1: Convert wide to long format
+intensity_df$CellID <- rownames(intensity_df)
+long_df <- reshape2::melt(intensity_df, id.vars = "CellID", variable.name = "Marker", value.name = "Intensity")
+
+# Step 2: Create boxplots for each marker, in purple
+ggplot(long_df, aes(x = Marker, y = Intensity)) +
+  geom_boxplot(fill = "purple", color = "black", outlier.color = "black") +
+  theme_minimal() +
+  labs(title = "Marker Expression per Cell", x = "Marker", y = "Mean Intensity") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+```{r}
+# Step 1: Reshape to long format
+intensity_df$CellID <- rownames(intensity_df)
+long_df <- reshape2::melt(intensity_df, id.vars = "CellID", variable.name = "Marker", value.name = "Intensity")
+
+# Step 2: Order markers by median intensity (optional but helpful)
+marker_order <- long_df %>%
+  group_by(Marker) %>%
+  summarize(median_int = median(Intensity, na.rm = TRUE)) %>%
+  arrange(desc(median_int)) %>%
+  pull(Marker)
+
+long_df$Marker <- factor(long_df$Marker, levels = marker_order)
+
+# Step 3: Create violin plot with enhancements
+ggplot(long_df, aes(x = Marker, y = Intensity)) +
+  geom_violin(fill = "purple", color = "black", alpha = 0.8) +          # purple fill
+  geom_boxplot(width = 0.1, outlier.shape = NA, color = "grey80") +     # white boxplot overlay
+  geom_hline(yintercept = 0.5, linetype = "dashed", color = "grey50") + # reference line at 0.5
+  theme_minimal(base_size = 12) +
+  labs(
+    title = "Marker Intensity Distributions",
+    subtitle = "Per-cell expression across all segmented cells",
+    x = "Marker",
+    y = "Mean Intensity"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 11)
+  )
+```
+
+
+## 3. Marker relationships & Co-expression Analysis
+
+
+
+
+
+
+
+
+
+
+
+## 4. Cell Subpopulation Analysis – Clustering 
+
+
+
+# Conclusion
+
+# Limitations
+
+# Appendix
